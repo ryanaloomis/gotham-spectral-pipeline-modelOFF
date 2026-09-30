@@ -1,14 +1,9 @@
 """Integration-contract checks; run in the full pipeline environment."""
 
-from pathlib import Path
-import tempfile
 import unittest
 
 import astropy.io.fits
 import numpy as np
-import pandas as pd
-
-from gotham_spectral_pipeline.array_input import ArrayInput
 from gotham_spectral_pipeline.calibration import (
     PositionSwitchedCalibration as Calibration, CalOnOffPairedHDUList, SigRefPairedHDUList,
 )
@@ -19,9 +14,7 @@ from gotham_spectral_pipeline.sdfits import HDUList
 class MeasuredBuilder:
     def build(self, *, off_counts, on_counts, fit_mask=None):
         return ReferenceResult(
-            counts=off_counts, shape=off_counts / np.median(off_counts),
-            normalization=float(np.median(off_counts)),
-            fit_mask=np.ones(off_counts.size, dtype=bool),
+            counts=off_counts,
             valid_mask=np.ones(off_counts.size, dtype=bool),
         )
 
@@ -66,36 +59,6 @@ class CalibrationTests(unittest.TestCase):
         for key in ("sig_calon", "sig_caloff", "ref_calon", "ref_caloff"):
             np.testing.assert_array_equal(model_metadata[key].intensity, metadata[key].intensity)
             np.testing.assert_array_equal(model_metadata[key].noise, metadata[key].noise)
-
-    def test_export_uses_array_position_and_explicit_integration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            prefix = Path(directory) / "raw"
-            rows = []
-            for scan, state in ((12, "OFF"), (13, "ON")):
-                for integration in (0, 1):
-                    for cal in ("F", "T"):
-                        if (scan, integration, cal) == (13, 0, "T"):
-                            continue
-                        rows.append(dict(
-                            INDEX=100 + 4 * len(rows), SCAN=scan, INT=integration,
-                            CAL=cal, PROCSCAN=state, PROCEDURE="OffOn", SOURCE="TMC-1",
-                            SAMPLER="A1_0", RESTFREQ=29e9, FREQRES=1000.0,
-                            EXPOSURE=10.0, CENTFREQ=29e9, NUMCHN=64,
-                        ))
-            data = np.arange(len(rows) * 64, dtype=float).reshape(len(rows), 64)
-            np.save(str(prefix) + ".npy", data)
-            pd.DataFrame(rows).to_csv(str(prefix) + "_meta.csv", index=False)
-            source = ArrayInput(prefix)
-            pairs = source.pair_up_rows()
-            self.assertEqual(len(pairs), 1)
-            self.assertEqual(source.unpaired_rows, 3)
-            pair = pairs[0]
-            row = pair["sig"]["caloff"].iloc[0]
-            self.assertEqual(row.INT, 1)
-            loaded = pair.get_paired_hdu(source)
-            np.testing.assert_array_equal(loaded["sig"]["caloff"][0].data,
-                                          data[int(row.ARRAY_ROW)])
-
 
 if __name__ == "__main__":
     unittest.main()

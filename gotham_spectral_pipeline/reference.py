@@ -5,7 +5,7 @@ frequency frames nor estimate Tsys. Model uncertainty is separate from the
 conditional, narrow-scale radiometer noise returned by calibration.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
@@ -19,11 +19,7 @@ class ReferenceFitError(ValueError):
 @dataclass
 class ReferenceResult:
     counts: np.ndarray
-    shape: np.ndarray
-    normalization: float
-    fit_mask: np.ndarray
     valid_mask: np.ndarray
-    diagnostics: dict = field(default_factory=dict)
 
 
 class ReferenceBuilder(Protocol):
@@ -148,17 +144,5 @@ class SmoothOffReference:
             raise ReferenceFitError("Invalid scalar normalization")
         return ReferenceResult(
             counts=amplitude * shape,
-            shape=shape,
-            normalization=amplitude,
-            fit_mask=fit_valid,
             valid_mask=supported,
-            diagnostics=dict(
-                kind="robust_cubic_spline", normalization_source=self.normalization,
-                knot_spacing_channels=self.knot_spacing, fit_bin=self.fit_bin,
-                edge_channels=edge, clip_sigma=self.clip_sigma, iterations=self.iterations,
-                knots=spline.get_knots(), coefficients=spline.get_coeffs(), degree=3,
-                bin_channel=bx, bin_counts=by, bin_keep=keep,
-                shape_scale=shape_scale, normalization_mask=normalization_mask,
-                uncertainty="conditional_on_fixed_model_and_normalization",
-            ),
         )

@@ -104,11 +104,9 @@ class Pipeline:
         *,
         calibration=PositionSwitchedCalibration,
         reference_builder=None,
-        diagnostics=None,
     ):
         self.calibration = calibration
         self.reference_builder = reference_builder
-        self.diagnostics = diagnostics
         self.sdfits = sdfits
         self.zenith_opacity = zenith_opacity
         self.beam_efficiency = beam_efficiency
@@ -227,10 +225,6 @@ class Pipeline:
             for calonoff in paired_row[sigref]
         }
 
-    def _diagnose(self, stage, paired_row, spectrum=None, metadata=None, reason=None):
-        if self.diagnostics is not None:
-            self.diagnostics(stage, paired_row, spectrum, metadata, reason)
-
     def _run_stage_pre_baseline(self) -> bool:
         total_exposure_aggregator = ExposureAggregator(
             ExposureAggregator.LinearTransformer(self._options.channel_width)
@@ -243,7 +237,6 @@ class Pipeline:
         for paired_row in tqdm.tqdm(
             self._input.paired_rows, dynamic_ncols=True, smoothing=0.0, leave=False
         ):
-            before_drops = self._output.integration_dropped_reason.copy()
             try:
                 sigrefpair = paired_row.get_paired_hdu(self._input.sdfits)
                 exposure = self.calibration.get_exposure(sigrefpair["sig"])
@@ -263,7 +256,6 @@ class Pipeline:
                     sigrefpair, freq_kwargs=dict(unit="Hz"), return_metadata=True,
                     reference_builder=self.reference_builder,
                 )
-                self._diagnose("calibration", paired_row, spectrum, spectrum_metadata)
                 if spectrum is None:
                     self._output.integration_dropped_reason[
                         "No calibrated spectrum returned"
@@ -303,7 +295,6 @@ class Pipeline:
                         .flag_frequency_domain_rfi()
                         .flag_valid_data()
                     )
-                    self._diagnose("legacy_rfi", paired_row, measured_spectrum)
                     (
                         spectrum.flag_nan()
                         .flag_head_tail(
@@ -313,7 +304,6 @@ class Pipeline:
                         .flag_frequency_domain_rfi()
                         .flag_valid_data()
                     )
-                    self._diagnose("model_rfi", paired_row, spectrum)
                     assert spectrum.flag is not None
                     assert measured_spectrum.flag is not None
                     invalid_reasons = (
@@ -327,7 +317,6 @@ class Pipeline:
                     )
                     spectrum.flag_valid_data()
 
-                self._diagnose("flagged", paired_row, spectrum)
                 if not self._check_num_rfi_channel(spectrum):
                     continue
 
@@ -347,7 +336,6 @@ class Pipeline:
                 )
             except ReferenceFitError as e:
                 self._output.integration_dropped_reason["Reference model fit failed"] += 1
-                self._diagnose("reference_failure", paired_row, reason=str(e))
             except self.Halt as e:
                 loguru.logger.critical(*e.args)
                 tqdm.tqdm.write(*e.args)
@@ -357,10 +345,6 @@ class Pipeline:
                     f"Uncaught exception while working on {self._get_debug_indices(paired_row)}\n{traceback.format_exc()}"
                 )
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
-            finally:
-                dropped = self._output.integration_dropped_reason - before_drops
-                self._diagnose("selection", paired_row,
-                               metadata=dict(accepted=not bool(dropped), reasons=dict(dropped)))
 
         self._output.total_exposure = total_exposure_aggregator.get_spectrum()
 
@@ -438,7 +422,6 @@ class Pipeline:
                     self._output.integration_dropped_reason[
                         "Failed baseline fitting"
                     ] += 1
-                    self._diagnose("baseline_failure", paired_row, reason="Baseline fitting returned None")
                     continue
 
                 baseline, _ = baseline_result
@@ -448,9 +431,6 @@ class Pipeline:
                 if correction_factor is not None:
                     baseline_substracted_spectrum *= correction_factor
 
-                if self.diagnostics is not None:
-                    self._diagnose("baseline", paired_row, baseline_substracted_spectrum,
-                                   metadata=dict(baseline=baseline(spectrum.frequency)))
                 filtered_integration = self.FilteredIntegration()
                 filtered_integration.paired_row = paired_row
                 filtered_integration.exposure = exposure
@@ -465,7 +445,6 @@ class Pipeline:
                     f"Uncaught exception while working on {self._get_debug_indices(paired_row)}\n{traceback.format_exc()}"
                 )
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
-                self._diagnose("baseline_failure", paired_row, reason=traceback.format_exc())
         return True
 
     def _run_stage_post_baseline(self) -> bool:

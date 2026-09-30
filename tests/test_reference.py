@@ -38,7 +38,6 @@ class ReferenceTests(unittest.TestCase):
         self.assertFalse(mask[:64].any())
         self.assertFalse(mask[-64:].any())
         self.assertTrue(np.isfinite(result.counts).all())
-        self.assertAlmostEqual(np.median(result.shape[result.fit_mask]), 1)
 
     def test_on_normalization_preserves_narrow_injection(self):
         on = 1.04 * self.band

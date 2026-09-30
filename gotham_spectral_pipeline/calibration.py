@@ -631,7 +631,7 @@ class PositionSwitchedCalibration(Calibration):
         assert frequency is not None
         model = reference.counts
         if any(numpy.shape(value) != on_counts.shape for value in
-               (model, reference.shape, reference.fit_mask, reference.valid_mask)):
+               (model, reference.valid_mask)):
             raise ValueError("Reference builder returned the wrong shape")
         # Preserve the legacy radiometer convention, changing only the reference
         # scale and excluding measured OFF thermal variance. Model/gain covariance
@@ -645,14 +645,7 @@ class PositionSwitchedCalibration(Calibration):
         noise = numpy.full_like(model, numpy.nan)
         intensity[valid] = Tsys * (on_counts[valid] - model[valid]) / model[valid]
         noise[valid] = on_noise[valid] * numpy.abs(off_counts[valid] / model[valid])
-        metadata["reference_model"] = dict(
-            on_counts=on_counts, off_counts=off_counts, model_counts=model,
-            shape=reference.shape, normalization=reference.normalization,
-            fit_mask=reference.fit_mask, valid_mask=reference.valid_mask,
-            native_output_coordinate=frequency,
-            native_reference_coordinate=cls.get_observed_frequency(ref_calonoffpair["caloff"]),
-            residual=off_counts - model, **reference.diagnostics,
-        )
+        # Retain the legacy-calibrated spectrum for the existing RFI-mask union.
         metadata["measured_calibrated"] = measured
         return with_metadata(Spectrum(
             intensity=intensity, frequency=frequency, noise=noise,
