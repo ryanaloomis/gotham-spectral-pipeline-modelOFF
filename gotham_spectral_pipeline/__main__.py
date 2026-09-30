@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from .cli import extract_system_temperature, generate_cleo_command, run_pipeline
+from .cli import extract_system_temperature, generate_cleo_command, run_pipeline, run_export_ab
 
 
 def main():
@@ -21,6 +21,7 @@ def main():
         extract_system_temperature,
         generate_cleo_command,
         run_pipeline,
+        run_export_ab,
     ]
     entry_points = dict()
     for subcommand in subcommands:

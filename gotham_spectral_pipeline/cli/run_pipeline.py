@@ -1,5 +1,6 @@
 import argparse
 import collections
+import json
 import os
 import pathlib
 import pprint
@@ -10,6 +11,8 @@ import loguru
 import tqdm  # type: ignore
 
 from .. import __version__
+from ..diagnostics import DiagnosticWriter
+from .reference_options import add_model_options, make_builder
 from .. import Spectrum, SpectrumAggregator
 from .. import Exposure, ExposureAggregator
 from .. import BeamEfficiency, PositionSwitchedCalibration, SDFits, ZenithOpacity
@@ -30,6 +33,9 @@ def help() -> str:
 
 
 def configure_parser(parser: argparse.ArgumentParser):
+    parser.add_argument("--reference-mode", choices=["measured", "smooth"], default="measured")
+    parser.add_argument("--diagnostics-directory", type=pathlib.Path)
+    add_model_options(parser)
     parser.add_argument("--sdfits", type=pathlib.Path, required=True)
     parser.add_argument("--zenith_opacity", type=pathlib.Path)
     parser.add_argument("--filter", type=str)
@@ -91,6 +97,18 @@ def main(args: argparse.Namespace):
         f"with the following command:\n{' '.join(quoted_arguments)}"
     )
 
+    reference_builder = make_builder(args) if args.reference_mode == "smooth" else None
+    if args.diagnostics_directory is not None:
+        directory = args.diagnostics_directory
+        if directory.exists() and any(directory.iterdir()):
+            raise ValueError("Use an empty diagnostics directory to avoid mixing reductions")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "manifest.json").write_text(json.dumps(dict(
+            version=__version__, coordinate="corrected_frequency_Hz", intensity_unit="K",
+            options={k: str(v) if isinstance(v, pathlib.Path) else v for k, v in vars(args).items()},
+            model_uncertainty="Conditional on fixed model and normalization; covariance omitted",
+        ), indent=2) + "\n")
+
     sdfits: SDFits = SDFits(args.sdfits)
     zenith_opacity: ZenithOpacity | None = (
         None if args.zenith_opacity is None else ZenithOpacity(args.zenith_opacity)
@@ -134,6 +152,9 @@ def main(args: argparse.Namespace):
                 beam_efficiency,
                 paired_rows,
                 Pipeline.Options.from_namespace(args),
+                reference_builder=reference_builder,
+                diagnostics=(None if args.diagnostics_directory is None else
+                             DiagnosticWriter(args.diagnostics_directory / f"group_{len(outputs):03d}")),
             )
             .calibrate()
             .get_output()

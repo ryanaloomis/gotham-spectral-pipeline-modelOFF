@@ -3,6 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - python=3.10
+  - typing_extensions>=4.0
   - ipykernel
   - ipympl
   - austin

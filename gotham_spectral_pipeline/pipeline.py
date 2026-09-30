@@ -2,6 +2,7 @@ import argparse
 import collections
 import loguru
 import math
+import numpy
 import sys
 import traceback
 from typing_extensions import Self
@@ -13,6 +14,7 @@ from . import GbtTsysLookupTable, GbtTsysHybridSelector, TsysThresholdSelector
 from . import BeamEfficiency, PositionSwitchedCalibration, SDFits, ZenithOpacity
 from . import Exposure, ExposureAggregator
 from . import Spectrum, SpectrumAggregator
+from .reference import ReferenceFitError
 
 __all__ = [
     "Pipeline",
@@ -99,7 +101,14 @@ class Pipeline:
         beam_efficiency: BeamEfficiency | None,
         paired_rows: list[SigRefPairedRows],
         options: Options,
+        *,
+        calibration=PositionSwitchedCalibration,
+        reference_builder=None,
+        diagnostics=None,
     ):
+        self.calibration = calibration
+        self.reference_builder = reference_builder
+        self.diagnostics = diagnostics
         self.sdfits = sdfits
         self.zenith_opacity = zenith_opacity
         self.beam_efficiency = beam_efficiency
@@ -191,7 +200,7 @@ class Pipeline:
         correction_factors = []
         if self._input.zenith_opacity is not None:
             opacity_correction_factor = (
-                PositionSwitchedCalibration.get_opacity_correction_factor(
+                self.calibration.get_opacity_correction_factor(
                     sigrefpair["sig"]["caloff"], self._input.zenith_opacity
                 )
             )
@@ -200,7 +209,7 @@ class Pipeline:
             correction_factors.append(opacity_correction_factor)
         if self._input.beam_efficiency is not None:
             efficiency_correction_factor = (
-                PositionSwitchedCalibration.get_efficiency_correction_factor(
+                self.calibration.get_efficiency_correction_factor(
                     sigrefpair["sig"]["caloff"], self._input.beam_efficiency
                 )
             )
@@ -218,6 +227,10 @@ class Pipeline:
             for calonoff in paired_row[sigref]
         }
 
+    def _diagnose(self, stage, paired_row, spectrum=None, metadata=None, reason=None):
+        if self.diagnostics is not None:
+            self.diagnostics(stage, paired_row, spectrum, metadata, reason)
+
     def _run_stage_pre_baseline(self) -> bool:
         total_exposure_aggregator = ExposureAggregator(
             ExposureAggregator.LinearTransformer(self._options.channel_width)
@@ -230,24 +243,27 @@ class Pipeline:
         for paired_row in tqdm.tqdm(
             self._input.paired_rows, dynamic_ncols=True, smoothing=0.0, leave=False
         ):
+            before_drops = self._output.integration_dropped_reason.copy()
             try:
                 sigrefpair = paired_row.get_paired_hdu(self._input.sdfits)
-                exposure = PositionSwitchedCalibration.get_exposure(sigrefpair["sig"])
+                exposure = self.calibration.get_exposure(sigrefpair["sig"])
                 if exposure is None:
                     self._output.integration_dropped_reason["No exposure returned"] += 1
                     continue
                 total_exposure_aggregator.merge(exposure)
 
-                if PositionSwitchedCalibration.should_be_discarded(sigrefpair):
+                if self.calibration.should_be_discarded(sigrefpair):
                     self._output.integration_dropped_reason["Failed prechecks"] += 1
                     continue
 
                 (
                     spectrum,
                     spectrum_metadata,
-                ) = PositionSwitchedCalibration.get_calibrated_spectrum(
-                    sigrefpair, freq_kwargs=dict(unit="Hz"), return_metadata=True
+                ) = self.calibration.get_calibrated_spectrum(
+                    sigrefpair, freq_kwargs=dict(unit="Hz"), return_metadata=True,
+                    reference_builder=self.reference_builder,
                 )
+                self._diagnose("calibration", paired_row, spectrum, spectrum_metadata)
                 if spectrum is None:
                     self._output.integration_dropped_reason[
                         "No calibrated spectrum returned"
@@ -261,16 +277,57 @@ class Pipeline:
                 ):
                     continue
 
-                (
-                    spectrum.flag_nan()
-                    .flag_head_tail(
-                        nchannel=self._options.flag_head_tail_channel_number
+                if self.reference_builder is None:
+                    # Keep the historical measured-reference flagging path
+                    # unchanged when the standard calibration is selected.
+                    (
+                        spectrum.flag_nan()
+                        .flag_head_tail(
+                            nchannel=self._options.flag_head_tail_channel_number
+                        )
+                        .flag_time_domain_rfi(spectrum_metadata)
+                        .flag_frequency_domain_rfi()
+                        .flag_valid_data()
                     )
-                    .flag_time_domain_rfi(spectrum_metadata)
-                    .flag_frequency_domain_rfi()
-                    .flag_valid_data()
-                )
+                else:
+                    # Run the historical checks on both calibrated spectra.
+                    # The model branch keeps either branch's RFI decision and
+                    # its own unsupported-edge/NaN flags.
+                    measured_spectrum = spectrum_metadata["measured_calibrated"]
+                    (
+                        measured_spectrum.flag_nan()
+                        .flag_head_tail(
+                            nchannel=self._options.flag_head_tail_channel_number
+                        )
+                        .flag_time_domain_rfi(spectrum_metadata)
+                        .flag_frequency_domain_rfi()
+                        .flag_valid_data()
+                    )
+                    self._diagnose("legacy_rfi", paired_row, measured_spectrum)
+                    (
+                        spectrum.flag_nan()
+                        .flag_head_tail(
+                            nchannel=self._options.flag_head_tail_channel_number
+                        )
+                        .flag_time_domain_rfi(spectrum_metadata)
+                        .flag_frequency_domain_rfi()
+                        .flag_valid_data()
+                    )
+                    self._diagnose("model_rfi", paired_row, spectrum)
+                    assert spectrum.flag is not None
+                    assert measured_spectrum.flag is not None
+                    invalid_reasons = (
+                        Spectrum.FlagReason.NAN
+                        | Spectrum.FlagReason.CHUNK_EDGES
+                        | Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI
+                        | Spectrum.FlagReason.TIME_DOMAIN_RFI
+                    ).value
+                    spectrum.flag[:] = (
+                        (spectrum.flag | measured_spectrum.flag) & invalid_reasons
+                    )
+                    spectrum.flag_valid_data()
 
+                self._diagnose("flagged", paired_row, spectrum)
                 if not self._check_num_rfi_channel(spectrum):
                     continue
 
@@ -288,6 +345,9 @@ class Pipeline:
                 self._pre_baseline_output.filtered_integrations.append(
                     filtered_integration
                 )
+            except ReferenceFitError as e:
+                self._output.integration_dropped_reason["Reference model fit failed"] += 1
+                self._diagnose("reference_failure", paired_row, reason=str(e))
             except self.Halt as e:
                 loguru.logger.critical(*e.args)
                 tqdm.tqdm.write(*e.args)
@@ -297,6 +357,10 @@ class Pipeline:
                     f"Uncaught exception while working on {self._get_debug_indices(paired_row)}\n{traceback.format_exc()}"
                 )
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
+            finally:
+                dropped = self._output.integration_dropped_reason - before_drops
+                self._diagnose("selection", paired_row,
+                               metadata=dict(accepted=not bool(dropped), reasons=dict(dropped)))
 
         self._output.total_exposure = total_exposure_aggregator.get_spectrum()
 
@@ -374,6 +438,7 @@ class Pipeline:
                     self._output.integration_dropped_reason[
                         "Failed baseline fitting"
                     ] += 1
+                    self._diagnose("baseline_failure", paired_row, reason="Baseline fitting returned None")
                     continue
 
                 baseline, _ = baseline_result
@@ -383,6 +448,9 @@ class Pipeline:
                 if correction_factor is not None:
                     baseline_substracted_spectrum *= correction_factor
 
+                if self.diagnostics is not None:
+                    self._diagnose("baseline", paired_row, baseline_substracted_spectrum,
+                                   metadata=dict(baseline=baseline(spectrum.frequency)))
                 filtered_integration = self.FilteredIntegration()
                 filtered_integration.paired_row = paired_row
                 filtered_integration.exposure = exposure
@@ -397,6 +465,7 @@ class Pipeline:
                     f"Uncaught exception while working on {self._get_debug_indices(paired_row)}\n{traceback.format_exc()}"
                 )
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
+                self._diagnose("baseline_failure", paired_row, reason=traceback.format_exc())
         return True
 
     def _run_stage_post_baseline(self) -> bool:
@@ -421,7 +490,58 @@ class Pipeline:
             )
             .get_spectrum()
         )
+        if self.reference_builder is not None:
+            self._flag_persistent_model_rfi()
         return True
+
+    def _flag_persistent_model_rfi(self):
+        """Flag narrow RFI that is weak per integration but repeats in the stack.
+
+        Run the existing frequency-domain detector on a finite, interpolated
+        copy of the final spectrum. This avoids invalid-channel NaNs/infinities
+        contaminating its local fits. Apply detections only where the original
+        output and both adjacent channels are valid, then clear VALID_DATA so
+        final consumers and saved products exclude those channels.
+        """
+        spectrum = self._output.spectrum
+        assert spectrum.frequency is not None
+        assert spectrum.noise is not None
+        assert spectrum.flag is not None
+
+        valid = (
+            spectrum.flagged(Spectrum.FlagReason.VALID_DATA)
+            & numpy.isfinite(spectrum.intensity)
+            & numpy.isfinite(spectrum.noise)
+            & (spectrum.noise > 0)
+        )
+        if valid.sum() < 3:
+            return
+
+        # Keep the complete coordinate grid for local fits, filling already
+        # invalid samples by interpolation and using one finite representative
+        # noise value. Detections are later restricted to valid interior channels.
+        intensity = numpy.interp(spectrum.frequency, spectrum.frequency[valid], spectrum.intensity[valid])
+        noise = numpy.full_like(spectrum.noise, numpy.median(spectrum.noise[valid]))
+        probe = Spectrum(intensity=intensity, frequency=spectrum.frequency, noise=noise)
+        probe.flag_frequency_domain_rfi()
+        assert probe.flag is not None
+        detected = probe.flagged(Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI)
+
+        testable = valid.copy()
+        testable[0] = False
+        testable[-1] = False
+        testable[1:-1] &= valid[:-2] & valid[2:]
+        newly_flagged = detected & testable
+        if not newly_flagged.any():
+            return
+
+        spectrum.flag[newly_flagged] |= Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI.value
+        spectrum.flag[newly_flagged] &= ~Spectrum.FlagReason.VALID_DATA.value
+        if numpy.array_equal(self._output.exposure.frequency, spectrum.frequency):
+            self._output.exposure.exposure[newly_flagged] = 0.0
+        loguru.logger.info(
+            f"Flagged {int(newly_flagged.sum())} additional persistent narrow-RFI channels in the smooth-reference aggregate."
+        )
 
     def calibrate(self) -> Self:
         if not self._run_stage_pre_baseline():

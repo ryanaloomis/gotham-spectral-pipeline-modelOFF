@@ -1,6 +1,7 @@
 from .beam_efficiency import BeamEfficiency
 from .sdfits import HDUList, SDFits
 from .spectrum import Exposure, Spectrum
+from .reference import ReferenceBuilder
 from .utils import datetime_parser, lru_cache
 from .zenith_opacity import ZenithOpacity
 
@@ -524,6 +525,7 @@ class PositionSwitchedCalibration(Calibration):
         sigrefpair: SigRefPairedHDUList,
         freq_kwargs: dict = dict(),
         *,
+        reference_builder: ReferenceBuilder | None = None,
         return_metadata: typing.Literal[False] = ...,
     ) -> Spectrum | None:
         ...
@@ -535,6 +537,7 @@ class PositionSwitchedCalibration(Calibration):
         sigrefpair: SigRefPairedHDUList,
         freq_kwargs: dict = dict(),
         *,
+        reference_builder: ReferenceBuilder | None = None,
         return_metadata: typing.Literal[True],
     ) -> tuple[Spectrum | None, dict]:
         ...
@@ -546,6 +549,7 @@ class PositionSwitchedCalibration(Calibration):
         sigrefpair: SigRefPairedHDUList,
         freq_kwargs: dict = dict(),
         *,
+        reference_builder: ReferenceBuilder | None = None,
         return_metadata: bool = False,
     ) -> (Spectrum | None) | tuple[Spectrum | None, dict]:
         ...
@@ -556,6 +560,7 @@ class PositionSwitchedCalibration(Calibration):
         sigrefpair: SigRefPairedHDUList,
         freq_kwargs: dict = dict(),
         *,
+        reference_builder: ReferenceBuilder | None = None,
         return_metadata: bool = False,
     ) -> (Spectrum | None) | tuple[Spectrum | None, dict]:
         metadata: dict[str, typing.Any] = dict()
@@ -608,7 +613,51 @@ class PositionSwitchedCalibration(Calibration):
         metadata["sig_calon"] = sig_metadata["calon"]
         metadata["sig_caloff"] = sig_metadata["caloff"]
 
-        return with_metadata(sig_total_power - ref_total_power)
+        measured = sig_total_power - ref_total_power
+        if reference_builder is None:
+            return with_metadata(measured)
+
+        # Fit the raw OFF, before its bandpass is divided out. Retain measured
+        # diode-state metadata above for the existing time-domain RFI detector.
+        def combined(pair):
+            return 0.5 * (
+                numpy.asarray(cls.get_intensity_raw_count(pair["calon"]), dtype=float)
+                + numpy.asarray(cls.get_intensity_raw_count(pair["caloff"]), dtype=float)
+            )
+
+        on_counts, off_counts = combined(sig_calonoffpair), combined(ref_calonoffpair)
+        reference = reference_builder.build(off_counts=off_counts, on_counts=on_counts)
+        frequency = cls.get_corrected_frequency(sig_calonoffpair["caloff"], **freq_kwargs)
+        assert frequency is not None
+        model = reference.counts
+        if any(numpy.shape(value) != on_counts.shape for value in
+               (model, reference.shape, reference.fit_mask, reference.valid_mask)):
+            raise ValueError("Reference builder returned the wrong shape")
+        # Preserve the legacy radiometer convention, changing only the reference
+        # scale and excluding measured OFF thermal variance. Model/gain covariance
+        # is not represented by Spectrum's diagonal noise array.
+        on_noise = 0.5 * numpy.sqrt(
+            cls.get_noise(sig_calonoffpair["calon"], Tsys) ** 2
+            + cls.get_noise(sig_calonoffpair["caloff"], Tsys) ** 2
+        )
+        valid = numpy.isfinite(model) & (model > 0)
+        intensity = numpy.full_like(model, numpy.nan)
+        noise = numpy.full_like(model, numpy.nan)
+        intensity[valid] = Tsys * (on_counts[valid] - model[valid]) / model[valid]
+        noise[valid] = on_noise[valid] * numpy.abs(off_counts[valid] / model[valid])
+        metadata["reference_model"] = dict(
+            on_counts=on_counts, off_counts=off_counts, model_counts=model,
+            shape=reference.shape, normalization=reference.normalization,
+            fit_mask=reference.fit_mask, valid_mask=reference.valid_mask,
+            native_output_coordinate=frequency,
+            native_reference_coordinate=cls.get_observed_frequency(ref_calonoffpair["caloff"]),
+            residual=off_counts - model, **reference.diagnostics,
+        )
+        metadata["measured_calibrated"] = measured
+        return with_metadata(Spectrum(
+            intensity=intensity, frequency=frequency, noise=noise,
+            flag=numpy.where(reference.valid_mask, 0, Spectrum.FlagReason.CHUNK_EDGES.value),
+        ))
 
 
 class PointingCalibration(Calibration):
