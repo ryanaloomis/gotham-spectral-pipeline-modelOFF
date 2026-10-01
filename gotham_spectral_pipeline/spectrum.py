@@ -781,7 +781,14 @@ class Spectrum(SpectrumLike):
                     m * m * sxx + c * c * s + syy + 2 * (m * c * sx - m * sxy - c * sy)
                 )
 
-        is_signal = numpy.where(chisq > scipy.special.chdtri(width_chisq, alpha))[0]
+        # When the tested window is also the fitted window, two parameters
+        # (slope and intercept) were estimated from these samples. They consume
+        # two degrees of freedom in the residual chi-square.
+        degrees_of_freedom = width_chisq - 2 if nbaseline == nchisq else width_chisq
+        degrees_of_freedom = max(degrees_of_freedom, 1)
+        is_signal = numpy.where(
+            chisq > scipy.special.chdtri(degrees_of_freedom, alpha)
+        )[0]
 
         res = numpy.zeros_like(intensity, dtype=bool)
         for i in range(width_chisq):

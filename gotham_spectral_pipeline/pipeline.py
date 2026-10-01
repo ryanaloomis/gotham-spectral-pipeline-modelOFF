@@ -410,13 +410,17 @@ class Pipeline:
                     Spectrum.FlagReason.SIGNAL, pre_baseline_aggregated_spectrum
                 )
 
+                residual_threshold = 0.1
+                if self.reference_builder is not None:
+                    residual_threshold *= math.sqrt(2)
+
                 baseline_result = spectrum.fit_baseline(
                     method="hybrid",
                     polynomial_options=dict(max_degree=20),
                     lomb_scargle_options=dict(
                         min_num_terms=0, max_num_terms=40, max_cycle=32
                     ),
-                    residual_threshold=0.1,
+                    residual_threshold=residual_threshold,
                 )
                 if baseline_result is None:
                     self._output.integration_dropped_reason[
@@ -481,26 +485,25 @@ class Pipeline:
             )
             .get_spectrum()
         )
-        if self.reference_builder is not None:
-            self._flag_persistent_model_rfi()
         return True
 
-    def _flag_persistent_model_rfi(self):
-        """Flag narrow RFI that is weak per integration but repeats in the stack.
+    @staticmethod
+    def flag_persistent_model_rfi(spectrum: Spectrum, exposure: Exposure):
+        """Flag narrow RFI that repeats in the complete smooth-reference stack.
 
         Run the existing frequency-domain detector on a finite, interpolated
-        copy of the final spectrum. This avoids invalid-channel NaNs/infinities
-        contaminating its local fits. Apply detections only where the original
-        output and both adjacent channels are valid, then clear VALID_DATA so
+        copy of the co-added spectrum. Exclude channels already marked as signal
+        to protect features identified by the pipeline's existing signal pass.
+        Apply detections only to valid interior channels and clear VALID_DATA so
         final consumers and saved products exclude those channels.
         """
-        spectrum = self._output.spectrum
         assert spectrum.frequency is not None
         assert spectrum.noise is not None
         assert spectrum.flag is not None
 
         valid = (
             spectrum.flagged(Spectrum.FlagReason.VALID_DATA)
+            & ~spectrum.flagged(Spectrum.FlagReason.SIGNAL)
             & numpy.isfinite(spectrum.intensity)
             & numpy.isfinite(spectrum.noise)
             & (spectrum.noise > 0)
@@ -528,10 +531,10 @@ class Pipeline:
 
         spectrum.flag[newly_flagged] |= Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI.value
         spectrum.flag[newly_flagged] &= ~Spectrum.FlagReason.VALID_DATA.value
-        if numpy.array_equal(self._output.exposure.frequency, spectrum.frequency):
-            self._output.exposure.exposure[newly_flagged] = 0.0
+        if numpy.array_equal(exposure.frequency, spectrum.frequency):
+            exposure.exposure[newly_flagged] = 0.0
         loguru.logger.info(
-            f"Flagged {int(newly_flagged.sum())} additional persistent narrow-RFI channels in the smooth-reference aggregate."
+            f"Flagged {int(newly_flagged.sum())} persistent narrow-RFI channels in the final smooth-reference spectrum."
         )
 
     def calibrate(self) -> Self:

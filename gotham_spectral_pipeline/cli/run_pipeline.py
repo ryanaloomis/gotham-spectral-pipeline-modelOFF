@@ -177,6 +177,8 @@ def main(args: argparse.Namespace):
         .merge_all(output.spectrum for output in outputs.values() if output.success)
         .get_spectrum()
     )
+    if reference_builder is not None:
+        Pipeline.flag_persistent_model_rfi(final_spectrum, final_exposure)
 
     output_directory = args.output_directory
     os.makedirs(output_directory, exist_ok=True)
