@@ -503,7 +503,7 @@ class Pipeline:
 
         valid = (
             spectrum.flagged(Spectrum.FlagReason.VALID_DATA)
-            & ~spectrum.flagged(Spectrum.FlagReason.SIGNAL)
+            #& ~spectrum.flagged(Spectrum.FlagReason.SIGNAL)
             & numpy.isfinite(spectrum.intensity)
             & numpy.isfinite(spectrum.noise)
             & (spectrum.noise > 0)
@@ -517,7 +517,7 @@ class Pipeline:
         intensity = numpy.interp(spectrum.frequency, spectrum.frequency[valid], spectrum.intensity[valid])
         noise = numpy.full_like(spectrum.noise, numpy.median(spectrum.noise[valid]))
         probe = Spectrum(intensity=intensity, frequency=spectrum.frequency, noise=noise)
-        probe.flag_frequency_domain_rfi()
+        probe.flag_frequency_domain_rfi(nadjacent=dict(baseline=15, chisq=1))
         assert probe.flag is not None
         detected = probe.flagged(Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI)
 
