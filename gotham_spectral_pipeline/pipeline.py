@@ -441,10 +441,22 @@ class Pipeline:
                 tqdm.tqdm.write(*e.args)
                 sys.exit(1)
             except Exception:
-                loguru.logger.critical(
-                    f"Uncaught exception while working on {self._get_debug_indices(paired_row)}\n{traceback.format_exc()}"
+                message = (
+                    f"Baseline exception for {self._get_debug_indices(paired_row)}\n"
+                    f"{traceback.format_exc()}"
                 )
+                loguru.logger.critical(message)
+                tqdm.tqdm.write(message)
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
+    
+        if len(self._baseline_output.filtered_integrations) == 0:
+            tqdm.tqdm.write(
+                f"ZERO BASELINE SURVIVORS: "
+                f"{len(self._pre_baseline_output.filtered_integrations)} entered baseline stage; "
+                f"drops={dict(self._output.integration_dropped_reason)}"
+            )
+            self._output.reason = "All integrations failed baseline fitting."
+            return False
         return True
 
     def _run_stage_post_baseline(self) -> bool:

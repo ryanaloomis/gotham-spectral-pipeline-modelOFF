@@ -914,14 +914,51 @@ class Spectrum(SpectrumLike):
         polynomial_options: dict[str, typing.Any] = {},
         lomb_scargle_options: dict[str, typing.Any] = {},
     ) -> tuple[Baseline, BaselineSupplementaryInfo] | None:
+
         fitted = ~self.flagged(~Spectrum.FlagReason.VALID_DATA)
-        frequency = (
+
+        full_frequency = (
             numpy.arange(fitted.size, dtype=numpy.float64)
             if self.frequency is None
-            else self.frequency[fitted]
+            else self.frequency
         )
+
+        frequency = full_frequency[fitted]
         intensity = self.intensity[fitted]
         noise = None if self.noise is None else self.noise[fitted]
+
+        # Fit broad baselines on a 16x-compressed native-channel grid.
+        # Binning is tied to the original channel indices so flagged gaps do not
+        # cause physically separated channels to be combined.
+        baseline_bin = 16
+        if baseline_bin > 1:
+            native_index = numpy.flatnonzero(fitted)
+            block = native_index // baseline_bin
+            _, inverse = numpy.unique(block, return_inverse=True)
+
+            count = numpy.bincount(inverse).astype(float)
+            frequency = numpy.bincount(inverse, weights=frequency) / count
+
+            if noise is None:
+                intensity = numpy.bincount(inverse, weights=intensity) / count
+            else:
+                weight = 1.0 / numpy.square(noise)
+                weight_sum = numpy.bincount(inverse, weights=weight)
+                intensity = (
+                    numpy.bincount(inverse, weights=intensity * weight)
+                    / weight_sum
+                )
+
+                # Keep the native-channel noise scale rather than the error on the
+                # binned mean. This preserves the meaning of the existing residual
+                # stopping criterion as closely as possible.
+                noise = numpy.sqrt(
+                    numpy.bincount(inverse, weights=numpy.square(noise)) / count
+                )
+
+            residual_half_moving_window = max(
+                1, residual_half_moving_window // baseline_bin
+            )
 
         if residual_threshold is not None and noise is None:
             loguru.logger.warning(
