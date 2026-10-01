@@ -4,6 +4,7 @@ import os
 import pathlib
 import pprint
 import sys
+import time
 import traceback
 
 import loguru
@@ -158,17 +159,23 @@ def main(args: argparse.Namespace):
             f"Some integrations dropped due to the following reasons:\n{pprint.pformat(dict(integration_dropped_reason))}"
         )
 
+    final_timings = dict()
+    timing_started = time.perf_counter()
     final_total_exposure = (
         ExposureAggregator(ExposureAggregator.LinearTransformer(args.channel_width))
         .merge_all(output.total_exposure for output in outputs.values())
         .get_spectrum()
     )
+    final_timings["total_exposure_aggregation"] = time.perf_counter() - timing_started
+    timing_started = time.perf_counter()
     final_exposure = (
         ExposureAggregator(ExposureAggregator.LinearTransformer(args.channel_width))
         .merge_all(final_total_exposure.split(), init_only=True)
         .merge_all(output.exposure for output in outputs.values() if output.success)
         .get_spectrum()
     )
+    final_timings["exposure_aggregation"] = time.perf_counter() - timing_started
+    timing_started = time.perf_counter()
     final_spectrum = (
         SpectrumAggregator(
             SpectrumAggregator.LinearTransformer(args.channel_width),
@@ -177,16 +184,48 @@ def main(args: argparse.Namespace):
         .merge_all(output.spectrum for output in outputs.values() if output.success)
         .get_spectrum()
     )
+    final_timings["science_aggregation"] = time.perf_counter() - timing_started
+    final_reference_residual = None
     if reference_builder is not None:
-        Pipeline.flag_persistent_model_rfi(final_spectrum, final_exposure)
+        timing_started = time.perf_counter()
+        final_reference_residual = (
+            SpectrumAggregator(
+                SpectrumAggregator.LinearTransformer(args.channel_width)
+            )
+            .merge_all(
+                output.reference_residual
+                for output in outputs.values()
+                if output.success and output.reference_residual is not None
+            )
+            .get_spectrum()
+        )
+        Pipeline.flag_persistent_model_rfi(
+            final_reference_residual, final_spectrum, final_exposure
+        )
+        final_timings["reference_residual_aggregation_and_mask"] = (
+            time.perf_counter() - timing_started
+        )
 
     output_directory = args.output_directory
     os.makedirs(output_directory, exist_ok=True)
 
+    timing_started = time.perf_counter()
     if any(output.success for output in outputs.values()):
         final_spectrum.to_npz(output_directory / prefix)
+        if final_reference_residual is not None:
+            final_reference_residual.to_npz(
+                output_directory / (prefix + ".reference_residual")
+            )
 
     final_total_exposure.to_npz(output_directory / (prefix + ".total_exposure"))
     final_exposure.to_npz(output_directory / (prefix + ".exposure"))
+    final_timings["output_writes"] = time.perf_counter() - timing_started
+    loguru.logger.info(
+        "Final pipeline timing: "
+        + ", ".join(
+            f"{name}={elapsed:.3f}s"
+            for name, elapsed in sorted(final_timings.items())
+        )
+    )
 
     log_limiter.log_silence_report()

@@ -4,6 +4,7 @@ import enum
 import functools
 import itertools
 import pathlib
+import time
 import typing
 from typing_extensions import Self
 
@@ -920,7 +921,16 @@ class Spectrum(SpectrumLike):
         residual_half_moving_window: int = 512,
         polynomial_options: dict[str, typing.Any] = {},
         lomb_scargle_options: dict[str, typing.Any] = {},
+        timings: dict[str, float] | None = None,
+        timing_prefix: str = "baseline",
     ) -> tuple[Baseline, BaselineSupplementaryInfo] | None:
+
+        def record_timing(name: str, started: float | None):
+            if timings is not None and started is not None:
+                key = f"{timing_prefix}.{name}"
+                timings[key] = timings.get(key, 0.0) + time.perf_counter() - started
+
+        timing_started = time.perf_counter() if timings is not None else None
 
         fitted = ~self.flagged(~Spectrum.FlagReason.VALID_DATA)
 
@@ -933,11 +943,13 @@ class Spectrum(SpectrumLike):
         frequency = full_frequency[fitted]
         intensity = self.intensity[fitted]
         noise = None if self.noise is None else self.noise[fitted]
+        record_timing("prepare", timing_started)
 
         # Fit broad baselines on a 16x-compressed native-channel grid.
         # Binning is tied to the original channel indices so flagged gaps do not
         # cause physically separated channels to be combined.
         baseline_bin = 16
+        timing_started = time.perf_counter() if timings is not None else None
         if baseline_bin > 1:
             native_index = numpy.flatnonzero(fitted)
             block = native_index // baseline_bin
@@ -966,6 +978,7 @@ class Spectrum(SpectrumLike):
             residual_half_moving_window = max(
                 1, residual_half_moving_window // baseline_bin
             )
+        record_timing("compression", timing_started)
 
         if residual_threshold is not None and noise is None:
             loguru.logger.warning(
@@ -980,6 +993,7 @@ class Spectrum(SpectrumLike):
         all_baseline_info: list[BaselineSupplementaryInfo] = []
 
         if method == "hybrid" or method == "polynomial":
+            timing_started = time.perf_counter() if timings is not None else None
             polynomial_result = _auto_fit_polynomial_baseline(
                 frequency,
                 intensity,
@@ -988,6 +1002,7 @@ class Spectrum(SpectrumLike):
                 residual_half_moving_window,
                 polynomial_options,
             )
+            record_timing("polynomial_fit", timing_started)
             if polynomial_result is None:
                 return None
 
@@ -996,6 +1011,7 @@ class Spectrum(SpectrumLike):
             all_baseline_info.append(baseline_info)
 
         if method == "hybrid" or method == "lomb-scargle":
+            timing_started = time.perf_counter() if timings is not None else None
             lomb_scargle_result = _auto_fit_lomb_scargle_baseline(
                 frequency,
                 intensity,
@@ -1004,12 +1020,16 @@ class Spectrum(SpectrumLike):
                 residual_half_moving_window,
                 lomb_scargle_options,
             )
+            record_timing("lomb_scargle_fit", timing_started)
             if lomb_scargle_result is None:
                 return None
 
             baseline_list, baseline_info_list = lomb_scargle_result
             all_baseline.extend(baseline_list)
             all_baseline_info.extend(baseline_info_list)
+            if timings is not None:
+                key = f"{timing_prefix}.lomb_scargle_terms"
+                timings[key] = timings.get(key, 0.0) + len(baseline_list)
 
         def combined_baseline(
             frequency: numpy.typing.NDArray[numpy.floating],

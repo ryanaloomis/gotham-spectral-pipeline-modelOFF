@@ -4,6 +4,7 @@ import loguru
 import math
 import numpy
 import sys
+import time
 import traceback
 from typing_extensions import Self
 
@@ -33,6 +34,7 @@ class Pipeline:
         paired_row: SigRefPairedRows
         exposure: Exposure
         spectrum: Spectrum
+        reference_residual: Spectrum | None
         correction_factor: Spectrum | None
 
     class PreBaselineOutput:
@@ -52,6 +54,7 @@ class Pipeline:
         total_exposure: Exposure
         exposure: Exposure
         spectrum: Spectrum
+        reference_residual: Spectrum | None
 
         def __init__(self):
             self.integration_dropped_reason = collections.Counter()
@@ -117,6 +120,7 @@ class Pipeline:
         self._baseline_output = self.BaselineOutput()
         self._post_baseline_output = self.PostBaselineOutput()
         self._output = self.Output()
+        self._timings: collections.defaultdict[str, float] = collections.defaultdict(float)
 
         self._input.sdfits = sdfits
         self._input.zenith_opacity = zenith_opacity
@@ -225,6 +229,18 @@ class Pipeline:
             for calonoff in paired_row[sigref]
         }
 
+    def _log_timing_report(self):
+        if not self._timings:
+            return
+        report = ", ".join(
+            f"{name}={elapsed:.0f}" if name.endswith("_terms")
+            else f"{name}={elapsed:.3f}s"
+            for name, elapsed in sorted(self._timings.items())
+        )
+        loguru.logger.info(
+            f"Pipeline timing for {len(self._input.paired_rows)} paired integrations: {report}"
+        )
+
     def _run_stage_pre_baseline(self) -> bool:
         total_exposure_aggregator = ExposureAggregator(
             ExposureAggregator.LinearTransformer(self._options.channel_width)
@@ -238,24 +254,31 @@ class Pipeline:
             self._input.paired_rows, dynamic_ncols=True, smoothing=0.0, leave=False
         ):
             try:
+                timing_started = time.perf_counter()
                 sigrefpair = paired_row.get_paired_hdu(self._input.sdfits)
                 exposure = self.calibration.get_exposure(sigrefpair["sig"])
                 if exposure is None:
+                    self._timings["pre.io_and_checks"] += time.perf_counter() - timing_started
                     self._output.integration_dropped_reason["No exposure returned"] += 1
                     continue
                 total_exposure_aggregator.merge(exposure)
 
-                if self.calibration.should_be_discarded(sigrefpair):
+                discarded = self.calibration.should_be_discarded(sigrefpair)
+                self._timings["pre.io_and_checks"] += time.perf_counter() - timing_started
+                if discarded:
                     self._output.integration_dropped_reason["Failed prechecks"] += 1
                     continue
 
+                timing_started = time.perf_counter()
                 (
                     spectrum,
                     spectrum_metadata,
                 ) = self.calibration.get_calibrated_spectrum(
                     sigrefpair, freq_kwargs=dict(unit="Hz"), return_metadata=True,
                     reference_builder=self.reference_builder,
+                    timings=self._timings,
                 )
+                self._timings["pre.calibration"] += time.perf_counter() - timing_started
                 if spectrum is None:
                     self._output.integration_dropped_reason[
                         "No calibrated spectrum returned"
@@ -269,6 +292,7 @@ class Pipeline:
                 ):
                     continue
 
+                timing_started = time.perf_counter()
                 if self.reference_builder is None:
                     # Keep the historical measured-reference flagging path
                     # unchanged when the standard calibration is selected.
@@ -300,9 +324,7 @@ class Pipeline:
                         .flag_head_tail(
                             nchannel=self._options.flag_head_tail_channel_number
                         )
-                        .flag_time_domain_rfi(spectrum_metadata)
                         .flag_frequency_domain_rfi()
-                        .flag_valid_data()
                     )
                     assert spectrum.flag is not None
                     assert measured_spectrum.flag is not None
@@ -316,6 +338,7 @@ class Pipeline:
                         (spectrum.flag | measured_spectrum.flag) & invalid_reasons
                     )
                     spectrum.flag_valid_data()
+                self._timings["pre.rfi"] += time.perf_counter() - timing_started
 
                 if not self._check_num_rfi_channel(spectrum):
                     continue
@@ -328,9 +351,14 @@ class Pipeline:
                 filtered_integration.paired_row = paired_row
                 filtered_integration.exposure = exposure
                 filtered_integration.spectrum = spectrum
+                filtered_integration.reference_residual = spectrum_metadata.get(
+                    "reference_residual"
+                )
+                timing_started = time.perf_counter()
                 filtered_integration.correction_factor = self._get_correction_factor(
                     sigrefpair
                 )
+                self._timings["pre.correction"] += time.perf_counter() - timing_started
                 self._pre_baseline_output.filtered_integrations.append(
                     filtered_integration
                 )
@@ -359,6 +387,7 @@ class Pipeline:
         return True
 
     def _run_stage_baseline(self) -> bool:
+        timing_started = time.perf_counter()
         pre_baseline_aggregated_spectrum = (
             SpectrumAggregator(
                 SpectrumAggregator.LinearTransformer(self._options.channel_width)
@@ -369,7 +398,10 @@ class Pipeline:
                     (
                         filtered_integration.spectrum,
                         filtered_integration.spectrum.fit_baseline(
-                            method="polynomial", polynomial_options=dict(degree=20)
+                            method="polynomial",
+                            polynomial_options=dict(degree=20),
+                            timings=self._timings,
+                            timing_prefix="baseline.signal_prepass",
                         ),
                     )
                     for filtered_integration in self._pre_baseline_output.filtered_integrations
@@ -393,8 +425,10 @@ class Pipeline:
                 | Spectrum.FlagReason.SIGNAL,
             )
         )
+        self._timings["baseline.signal_prepass"] += time.perf_counter() - timing_started
 
         self._baseline_output.filtered_integrations = list()
+        timing_started = time.perf_counter()
         for filtered_integration in tqdm.tqdm(
             self._pre_baseline_output.filtered_integrations,
             dynamic_ncols=True,
@@ -404,6 +438,7 @@ class Pipeline:
             paired_row = filtered_integration.paired_row
             exposure = filtered_integration.exposure
             spectrum = filtered_integration.spectrum
+            reference_residual = filtered_integration.reference_residual
             correction_factor = filtered_integration.correction_factor
             try:
                 spectrum.copy_flags(
@@ -414,6 +449,7 @@ class Pipeline:
                 if self.reference_builder is not None:
                     residual_threshold *= math.sqrt(2)
 
+                fit_timing_started = time.perf_counter()
                 baseline_result = spectrum.fit_baseline(
                     method="hybrid",
                     polynomial_options=dict(max_degree=20),
@@ -421,6 +457,11 @@ class Pipeline:
                         min_num_terms=0, max_num_terms=40, max_cycle=32
                     ),
                     residual_threshold=residual_threshold,
+                    timings=self._timings,
+                    timing_prefix="baseline.integration",
+                )
+                self._timings["baseline.integration_fit"] += (
+                    time.perf_counter() - fit_timing_started
                 )
                 if baseline_result is None:
                     self._output.integration_dropped_reason[
@@ -429,16 +470,27 @@ class Pipeline:
                     continue
 
                 baseline, _ = baseline_result
+                evaluation_timing_started = time.perf_counter()
                 baseline_substracted_spectrum = spectrum - spectrum.from_callable(
                     baseline
                 )
+                self._timings["baseline.integration_evaluation"] += (
+                    time.perf_counter() - evaluation_timing_started
+                )
                 if correction_factor is not None:
+                    correction_timing_started = time.perf_counter()
                     baseline_substracted_spectrum *= correction_factor
+                    if reference_residual is not None:
+                        reference_residual *= correction_factor
+                    self._timings["baseline.integration_correction"] += (
+                        time.perf_counter() - correction_timing_started
+                    )
 
                 filtered_integration = self.FilteredIntegration()
                 filtered_integration.paired_row = paired_row
                 filtered_integration.exposure = exposure
                 filtered_integration.spectrum = baseline_substracted_spectrum
+                filtered_integration.reference_residual = reference_residual
                 self._baseline_output.filtered_integrations.append(filtered_integration)
             except self.Halt as e:
                 loguru.logger.critical(*e.args)
@@ -452,7 +504,9 @@ class Pipeline:
                 loguru.logger.critical(message)
                 tqdm.tqdm.write(message)
                 self._output.integration_dropped_reason["Uncaught exception"] += 1
-    
+
+        self._timings["baseline.integration_fits"] += time.perf_counter() - timing_started
+
         if len(self._baseline_output.filtered_integrations) == 0:
             tqdm.tqdm.write(
                 f"ZERO BASELINE SURVIVORS: "
@@ -464,6 +518,7 @@ class Pipeline:
         return True
 
     def _run_stage_post_baseline(self) -> bool:
+        timing_started = time.perf_counter()
         self._output.exposure = (
             ExposureAggregator(
                 ExposureAggregator.LinearTransformer(self._options.channel_width)
@@ -475,6 +530,8 @@ class Pipeline:
             )
             .get_spectrum()
         )
+        self._timings["post.exposure_aggregation"] += time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
         self._output.spectrum = (
             SpectrumAggregator(
                 SpectrumAggregator.LinearTransformer(self._options.channel_width)
@@ -485,67 +542,110 @@ class Pipeline:
             )
             .get_spectrum()
         )
+        self._timings["post.science_aggregation"] += time.perf_counter() - timing_started
+        if self.reference_builder is not None:
+            timing_started = time.perf_counter()
+            self._output.reference_residual = (
+                SpectrumAggregator(
+                    SpectrumAggregator.LinearTransformer(self._options.channel_width)
+                )
+                .merge_all(
+                    filtered_integration.reference_residual
+                    for filtered_integration in self._baseline_output.filtered_integrations
+                    if filtered_integration.reference_residual is not None
+                )
+                .get_spectrum()
+            )
+            self._timings["post.reference_residual_aggregation"] += (
+                time.perf_counter() - timing_started
+            )
+        else:
+            self._output.reference_residual = None
         return True
 
     @staticmethod
-    def flag_persistent_model_rfi(spectrum: Spectrum, exposure: Exposure):
-        """Flag narrow RFI that repeats in the complete smooth-reference stack.
+    def flag_persistent_model_rfi(
+        reference_residual: Spectrum,
+        spectrum: Spectrum | Exposure,
+        exposure: Exposure | None = None,
+    ):
+        """Use the aggregated OFF residual to flag persistent narrow RFI.
 
-        Run the existing frequency-domain detector on a finite, interpolated
-        copy of the co-added spectrum. Exclude channels already marked as signal
-        to protect features identified by the pipeline's existing signal pass.
-        Apply detections only to valid interior channels and clear VALID_DATA so
-        final consumers and saved products exclude those channels.
+        The two-argument form is retained for callers of the old helper. The
+        smooth-reference pipeline uses the three-argument form, in which the
+        detector never examines the science-spectrum morphology or SIGNAL mask.
         """
+        legacy_mode = exposure is None
+        if legacy_mode:
+            exposure = spectrum  # type: ignore[assignment]
+            spectrum = reference_residual
+            assert isinstance(spectrum, Spectrum)
+            reference_residual = spectrum
+        assert isinstance(spectrum, Spectrum)
+        assert isinstance(exposure, Exposure)
+        assert reference_residual.frequency is not None
+        assert reference_residual.noise is not None
+        assert reference_residual.flag is not None
         assert spectrum.frequency is not None
-        assert spectrum.noise is not None
         assert spectrum.flag is not None
 
         valid = (
-            spectrum.flagged(Spectrum.FlagReason.VALID_DATA)
-            #& ~spectrum.flagged(Spectrum.FlagReason.SIGNAL)
-            & numpy.isfinite(spectrum.intensity)
-            & numpy.isfinite(spectrum.noise)
-            & (spectrum.noise > 0)
+            reference_residual.flagged(Spectrum.FlagReason.VALID_DATA)
+            & numpy.isfinite(reference_residual.intensity)
+            & numpy.isfinite(reference_residual.noise)
+            & (reference_residual.noise > 0)
         )
-        if valid.sum() < 3:
-            return
+        z = numpy.abs(reference_residual.intensity / reference_residual.noise)
+        persistent_birdies = valid & (z > 5.0)
 
-        # Keep the complete coordinate grid for local fits, filling already
-        # invalid samples by interpolation and using one finite representative
-        # noise value. Detections are later restricted to valid interior channels.
-        intensity = numpy.interp(spectrum.frequency, spectrum.frequency[valid], spectrum.intensity[valid])
-        noise = numpy.full_like(spectrum.noise, numpy.median(spectrum.noise[valid]))
-        probe = Spectrum(intensity=intensity, frequency=spectrum.frequency, noise=noise)
-        probe.flag_frequency_domain_rfi(nadjacent=dict(baseline=15, chisq=1))
-        assert probe.flag is not None
-        detected = probe.flagged(Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI)
+        if legacy_mode:
+            # Compatibility for the old direct helper API only. The actual
+            # smooth-reference pipeline always supplies an independent residual.
+            persistent_birdies &= ~spectrum.flagged(Spectrum.FlagReason.SIGNAL)
 
-        testable = valid.copy()
-        testable[0] = False
-        testable[-1] = False
-        testable[1:-1] &= valid[:-2] & valid[2:]
-        newly_flagged = detected & testable
-        if not newly_flagged.any():
-            return
+        if not numpy.array_equal(reference_residual.frequency, spectrum.frequency):
+            raise ValueError("Reference residual and science spectra use different grids")
+        if not numpy.array_equal(exposure.frequency, spectrum.frequency):
+            raise ValueError("Science spectrum and exposure use different grids")
 
-        spectrum.flag[newly_flagged] |= Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI.value
-        spectrum.flag[newly_flagged] &= ~Spectrum.FlagReason.VALID_DATA.value
-        if numpy.array_equal(exposure.frequency, spectrum.frequency):
-            exposure.exposure[newly_flagged] = 0.0
+        overlap_signal = persistent_birdies & spectrum.flagged(Spectrum.FlagReason.SIGNAL)
+        newly_invalidated = persistent_birdies & spectrum.flagged(
+            Spectrum.FlagReason.VALID_DATA
+        )
+        spectrum.flag[persistent_birdies] |= (
+            Spectrum.FlagReason.FREQUENCY_DOMAIN_RFI.value
+        )
+        spectrum.flag[persistent_birdies] &= ~Spectrum.FlagReason.VALID_DATA.value
+        exposure.exposure[persistent_birdies] = 0.0
         loguru.logger.info(
-            f"Flagged {int(newly_flagged.sum())} persistent narrow-RFI channels in the final smooth-reference spectrum."
+            "Persistent OFF-residual birdies: "
+            f"{int(persistent_birdies.sum())} channels, "
+            f"{int(overlap_signal.sum())} overlap SIGNAL, "
+            f"{int(newly_invalidated.sum())} newly invalidated science channels."
         )
 
     def calibrate(self) -> Self:
+        timing_started = time.perf_counter()
         if not self._run_stage_pre_baseline():
+            self._timings["stage.pre_baseline"] += time.perf_counter() - timing_started
+            self._log_timing_report()
             return self
+        self._timings["stage.pre_baseline"] += time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
         if not self._run_stage_baseline():
+            self._timings["stage.baseline"] += time.perf_counter() - timing_started
+            self._log_timing_report()
             return self
+        self._timings["stage.baseline"] += time.perf_counter() - timing_started
+        timing_started = time.perf_counter()
         if not self._run_stage_post_baseline():
+            self._timings["stage.post_baseline"] += time.perf_counter() - timing_started
+            self._log_timing_report()
             return self
+        self._timings["stage.post_baseline"] += time.perf_counter() - timing_started
         self._output.success = True
         self._output.reason = "Success"
+        self._log_timing_report()
         return self
 
     def get_output(self) -> Output:

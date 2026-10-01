@@ -14,6 +14,7 @@ import loguru
 import numpy
 import numpy.typing
 import pandas
+import time
 
 __all__ = [
     "CalOnOffPairedHDUList",
@@ -527,6 +528,7 @@ class PositionSwitchedCalibration(Calibration):
         *,
         reference_builder: ReferenceBuilder | None = None,
         return_metadata: typing.Literal[False] = ...,
+        timings: dict[str, float] | None = None,
     ) -> Spectrum | None:
         ...
 
@@ -539,6 +541,7 @@ class PositionSwitchedCalibration(Calibration):
         *,
         reference_builder: ReferenceBuilder | None = None,
         return_metadata: typing.Literal[True],
+        timings: dict[str, float] | None = None,
     ) -> tuple[Spectrum | None, dict]:
         ...
 
@@ -551,6 +554,7 @@ class PositionSwitchedCalibration(Calibration):
         *,
         reference_builder: ReferenceBuilder | None = None,
         return_metadata: bool = False,
+        timings: dict[str, float] | None = None,
     ) -> (Spectrum | None) | tuple[Spectrum | None, dict]:
         ...
 
@@ -562,8 +566,13 @@ class PositionSwitchedCalibration(Calibration):
         *,
         reference_builder: ReferenceBuilder | None = None,
         return_metadata: bool = False,
+        timings: dict[str, float] | None = None,
     ) -> (Spectrum | None) | tuple[Spectrum | None, dict]:
         metadata: dict[str, typing.Any] = dict()
+
+        def record_timing(name: str, started: float):
+            if timings is not None:
+                timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
 
         def with_metadata(result: Spectrum | None):
             if return_metadata:
@@ -573,6 +582,7 @@ class PositionSwitchedCalibration(Calibration):
 
         sig_calonoffpair = sigrefpair["sig"]
         ref_calonoffpair = sigrefpair["ref"]
+        timing_started = time.perf_counter()
         Tcal = ref_calonoffpair.get_property(
             cls.get_calibration_temperature, property_name="Tcal"
         )
@@ -584,7 +594,9 @@ class PositionSwitchedCalibration(Calibration):
         metadata["ObsFreq"] = ref_calonoffpair.get_property(
             lambda hdulist: hdulist[0].header["OBSFREQ"], property_name="ObsFreq"
         )
+        record_timing("pre.calibration.tsys_and_metadata", timing_started)
 
+        timing_started = time.perf_counter()
         ref_total_power, ref_metadata = cls.get_total_power_spectrum(
             ref_calonoffpair,
             Tcal=Tcal,
@@ -593,12 +605,14 @@ class PositionSwitchedCalibration(Calibration):
             freq_kwargs=freq_kwargs,
             return_metadata=True,
         )
+        record_timing("pre.calibration.reference_total_power", timing_started)
         if ref_total_power is None:
             return with_metadata(None)
         metadata["ref_total_power"] = ref_total_power
         metadata["ref_calon"] = ref_metadata["calon"]
         metadata["ref_caloff"] = ref_metadata["caloff"]
 
+        timing_started = time.perf_counter()
         sig_total_power, sig_metadata = cls.get_total_power_spectrum(
             sig_calonoffpair,
             Tcal=Tcal,
@@ -607,6 +621,7 @@ class PositionSwitchedCalibration(Calibration):
             freq_kwargs=freq_kwargs,
             return_metadata=True,
         )
+        record_timing("pre.calibration.signal_total_power", timing_started)
         if sig_total_power is None:
             return with_metadata(None)
         metadata["sig_total_power"] = sig_total_power
@@ -619,6 +634,7 @@ class PositionSwitchedCalibration(Calibration):
 
         # Fit the raw OFF, before its bandpass is divided out. Retain measured
         # diode-state metadata above for the existing time-domain RFI detector.
+        timing_started = time.perf_counter()
         def combined(pair):
             return 0.5 * (
                 numpy.asarray(cls.get_intensity_raw_count(pair["calon"]), dtype=float)
@@ -633,6 +649,40 @@ class PositionSwitchedCalibration(Calibration):
         if any(numpy.shape(value) != on_counts.shape for value in
                (model, reference.valid_mask)):
             raise ValueError("Reference builder returned the wrong shape")
+        off_noise = 0.5 * numpy.sqrt(
+            cls.get_noise(ref_calonoffpair["calon"], Tsys) ** 2
+            + cls.get_noise(ref_calonoffpair["caloff"], Tsys) ** 2
+        )
+        residual_valid = (
+            numpy.asarray(reference.valid_mask, dtype=bool)
+            & numpy.isfinite(model)
+            & (model > 0)
+            & numpy.isfinite(off_counts)
+            & numpy.isfinite(off_noise)
+            & (off_noise > 0)
+        )
+        residual_intensity = numpy.full_like(model, numpy.nan)
+        residual_noise = numpy.full_like(model, numpy.nan)
+        residual_intensity[residual_valid] = (
+            Tsys * (off_counts[residual_valid] - model[residual_valid])
+            / model[residual_valid]
+        )
+        residual_noise[residual_valid] = (
+            off_noise[residual_valid]
+            * numpy.abs(off_counts[residual_valid] / model[residual_valid])
+        )
+        residual_flag = numpy.where(
+            residual_valid,
+            Spectrum.FlagReason.VALID_DATA.value,
+            Spectrum.FlagReason.CHUNK_EDGES.value,
+        )
+        metadata["reference_residual"] = Spectrum(
+            intensity=residual_intensity,
+            frequency=frequency,
+            noise=residual_noise,
+            flag=residual_flag,
+        )
+        record_timing("pre.calibration.reference_residual", timing_started)
         # Preserve the legacy radiometer convention, changing only the reference
         # scale and excluding measured OFF thermal variance. Model/gain covariance
         # is not represented by Spectrum's diagonal noise array.
