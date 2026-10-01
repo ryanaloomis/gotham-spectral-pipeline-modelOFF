@@ -1,7 +1,6 @@
 import collections
 import dataclasses
 import enum
-import functools
 import itertools
 import pathlib
 import time
@@ -31,6 +30,7 @@ Baseline = typing.Callable[
 ]
 BaselineSupplementaryInfo = dict[str, typing.Any]
 _SpectrumLike = typing.TypeVar("_SpectrumLike", bound="SpectrumLike")
+_LOMB_SCARGLE_METHOD_KWDS = {"algorithm": "fasper"}
 
 
 def _fit_polynomial_baseline(
@@ -138,26 +138,63 @@ def _fit_lomb_scargle_baseline(
     frequency: numpy.typing.NDArray[numpy.floating],
     intensity: numpy.typing.NDArray[numpy.floating],
     noise: numpy.typing.NDArray[numpy.floating] | None,
-    max_cycle: float | None = None,
-) -> tuple[Baseline, BaselineSupplementaryInfo]:
+    max_ls_frequency: float | None = None,
+    frequency_grid: numpy.typing.NDArray[numpy.floating] | None = None,
+    copy_intensity: bool = False,
+) -> tuple[
+    Baseline,
+    BaselineSupplementaryInfo,
+    numpy.typing.NDArray[numpy.floating],
+]:
+    # Keep the fitted model's data independent of the adaptive residual array,
+    # which is updated in place between terms below. The fixed-term path retains
+    # the historical reference behavior for its returned Astropy objects.
+    intensity_for_fit = (
+        numpy.array(intensity, copy=True) if copy_intensity else intensity
+    )
     if noise is None:
-        lomb_scargle = astropy.timeseries.LombScargle(frequency, intensity)
+        lomb_scargle = astropy.timeseries.LombScargle(frequency, intensity_for_fit)
     else:
-        lomb_scargle = astropy.timeseries.LombScargle(frequency, intensity, noise)
+        lomb_scargle = astropy.timeseries.LombScargle(
+            frequency, intensity_for_fit, noise
+        )
 
-    if max_cycle is None:
-        ls_frequency, power = lomb_scargle.autopower(method="fast")
+    if frequency_grid is None:
+        if max_ls_frequency is None:
+            ls_frequency, power = lomb_scargle.autopower(
+                method="fast", method_kwds=_LOMB_SCARGLE_METHOD_KWDS
+            )
+        else:
+            ls_frequency, power = lomb_scargle.autopower(
+                method="fast",
+                maximum_frequency=max_ls_frequency,
+                method_kwds=_LOMB_SCARGLE_METHOD_KWDS,
+            )
     else:
-        min_frequency = (frequency.max() - frequency.min()) / max_cycle
-        max_ls_frequency = 1 / min_frequency
-        ls_frequency, power = lomb_scargle.autopower(
-            method="fast", maximum_frequency=max_ls_frequency
+        ls_frequency = frequency_grid
+        power = lomb_scargle.power(
+            ls_frequency,
+            method="fast",
+            method_kwds=_LOMB_SCARGLE_METHOD_KWDS,
+            assume_regular_frequency=True,
         )
     best_ls_frequency = ls_frequency[numpy.argmax(power)]
-    return functools.partial(lomb_scargle.model, frequency=best_ls_frequency), {
-        "lomb_scargle": lomb_scargle,
-        "best_ls_frequency": best_ls_frequency,
-    }
+    model_offset = lomb_scargle.offset()
+    model_parameters = lomb_scargle.model_parameters(best_ls_frequency)
+
+    def model(t):
+        return model_offset + numpy.dot(
+            lomb_scargle.design_matrix(best_ls_frequency, t=t), model_parameters
+        )
+
+    return (
+        model,
+        {
+            "lomb_scargle": lomb_scargle,
+            "best_ls_frequency": best_ls_frequency,
+        },
+        ls_frequency,
+    )
 
 
 def _auto_fit_lomb_scargle_baseline(
@@ -171,9 +208,17 @@ def _auto_fit_lomb_scargle_baseline(
     num_terms = lomb_scargle_options.pop("num_terms", None)
     min_num_terms = lomb_scargle_options.pop("min_num_terms", 0)
     max_num_terms = lomb_scargle_options.pop("max_num_terms", 128)
+    max_cycle = lomb_scargle_options.pop("max_cycle", None)
+
+    if max_cycle is None:
+        max_ls_frequency = None
+    else:
+        min_frequency = (frequency.max() - frequency.min()) / max_cycle
+        max_ls_frequency = 1 / min_frequency
 
     baseline_list: list[Baseline] = []
     baseline_info_list: list[BaselineSupplementaryInfo] = []
+    frequency_grid = None
 
     if num_terms is None:
         if noise is None:
@@ -200,11 +245,18 @@ def _auto_fit_lomb_scargle_baseline(
         # Find minimum number of terms such that residual < residual_threshold using linear search.
         # If no such degree is found, use max_num_terms.
         success = False
+        intensity = numpy.array(intensity, copy=True)
         for num_terms in range(1, max_num_terms + 1):
-            baseline, baseline_info = _fit_lomb_scargle_baseline(
-                frequency, intensity, noise, **lomb_scargle_options
+            baseline, baseline_info, frequency_grid = _fit_lomb_scargle_baseline(
+                frequency,
+                intensity,
+                noise,
+                max_ls_frequency=max_ls_frequency,
+                frequency_grid=frequency_grid,
+                copy_intensity=True,
+                **lomb_scargle_options,
             )
-            intensity = intensity - baseline(frequency)
+            intensity -= baseline(frequency)
 
             baseline_info["residual"] = residual = _compute_residual(
                 intensity, noise, residual_half_moving_window
@@ -227,8 +279,13 @@ def _auto_fit_lomb_scargle_baseline(
         return baseline_list, baseline_info_list
     else:
         for _ in range(num_terms):
-            baseline, baseline_info = _fit_lomb_scargle_baseline(
-                frequency, intensity, noise, **lomb_scargle_options
+            baseline, baseline_info, frequency_grid = _fit_lomb_scargle_baseline(
+                frequency,
+                intensity,
+                noise,
+                max_ls_frequency=max_ls_frequency,
+                frequency_grid=frequency_grid,
+                **lomb_scargle_options,
             )
             intensity -= baseline(frequency)
 

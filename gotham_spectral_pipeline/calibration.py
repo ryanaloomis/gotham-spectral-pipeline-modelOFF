@@ -230,6 +230,7 @@ class Calibration:
 
         if frequency is None:
             return with_metadata(None)
+        metadata["_frequency"] = frequency
 
         if Tcal is None:
             Tcal = calonoffpair.get_property(
@@ -643,7 +644,10 @@ class PositionSwitchedCalibration(Calibration):
 
         on_counts, off_counts = combined(sig_calonoffpair), combined(ref_calonoffpair)
         reference = reference_builder.build(off_counts=off_counts, on_counts=on_counts)
-        frequency = cls.get_corrected_frequency(sig_calonoffpair["caloff"], **freq_kwargs)
+        # Reuse the raw-order frequency grid already computed by the signal
+        # total-power calculation.  The Spectrum object sorts its own grid,
+        # while the raw count arrays below remain in native order.
+        frequency = sig_metadata["_frequency"]
         assert frequency is not None
         model = reference.counts
         if any(numpy.shape(value) != on_counts.shape for value in

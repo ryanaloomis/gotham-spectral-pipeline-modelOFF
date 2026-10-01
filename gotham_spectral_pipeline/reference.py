@@ -66,15 +66,29 @@ class SmoothOffReference:
             valid[-edge:] = False
         x = np.arange(off.size, dtype=float)
         # Median compression prevents isolated raw-channel spikes from dominating.
-        bx, by = [], []
-        for start in range(edge, off.size - edge, self.fit_bin):
-            stop = min(start + self.fit_bin, off.size - edge)
-            good = valid[start:stop]
-            if good.sum() < max(2, (stop - start + 1) // 2):
-                continue
-            bx.append(np.median(x[start:stop][good]))
-            by.append(np.median(off[start:stop][good]))
-        bx, by = np.asarray(bx), np.asarray(by)
+        fit_stop = off.size - edge
+        fit_size = fit_stop - edge
+        if fit_size >= self.fit_bin and fit_size % self.fit_bin == 0:
+            valid_blocks = valid[edge:fit_stop].reshape(-1, self.fit_bin)
+            x_blocks = x[edge:fit_stop].reshape(-1, self.fit_bin)
+            off_blocks = off[edge:fit_stop].reshape(-1, self.fit_bin)
+            min_good = max(2, (self.fit_bin + 1) // 2)
+            keep_blocks = valid_blocks.sum(axis=1) >= min_good
+            valid_blocks = valid_blocks[keep_blocks]
+            x_blocks = x_blocks[keep_blocks]
+            off_blocks = off_blocks[keep_blocks]
+            bx = np.nanmedian(np.where(valid_blocks, x_blocks, np.nan), axis=1)
+            by = np.nanmedian(np.where(valid_blocks, off_blocks, np.nan), axis=1)
+        else:
+            bx_list, by_list = [], []
+            for start in range(edge, fit_stop, self.fit_bin):
+                stop = min(start + self.fit_bin, fit_stop)
+                good = valid[start:stop]
+                if good.sum() < max(2, (stop - start + 1) // 2):
+                    continue
+                bx_list.append(np.median(x[start:stop][good]))
+                by_list.append(np.median(off[start:stop][good]))
+            bx, by = np.asarray(bx_list), np.asarray(by_list)
         if bx.size < 8:
             raise ReferenceFitError("Too few supported bins")
         knots = np.arange(bx[0] + self.knot_spacing, bx[-1], self.knot_spacing)
@@ -91,6 +105,7 @@ class SmoothOffReference:
             except ValueError as exc:
                 raise ReferenceFitError(str(exc)) from exc
 
+        spline_needs_refit = True
         for _ in range(self.iterations):
             spline = fit()
             residual = by - spline(bx)
@@ -98,12 +113,15 @@ class SmoothOffReference:
             scale = 1.4826 * np.median(np.abs(residual[keep] - center))
             floor = 100 * np.finfo(float).eps * np.max(np.abs(by[keep]))
             if not np.isfinite(scale) or scale <= floor:
+                spline_needs_refit = False
                 break
             new_keep = keep & (np.abs(residual - center) <= self.clip_sigma * scale)
             if np.array_equal(keep, new_keep):
+                spline_needs_refit = False
                 break
             keep = new_keep
-        spline = fit()
+        if spline_needs_refit:
+            spline = fit()
         # Clamp unsupported edges to boundary values, and exclude them using
         # valid_mask. Finite padding avoids poisoning the existing RFI detector's
         # chunk means with artificial NaNs. These channels never enter science fits.
@@ -124,6 +142,7 @@ class SmoothOffReference:
             source = off if self.normalization == "off" else on
             normalization_mask &= np.isfinite(source) & (source > 0)
             ratio = source / shape
+            normalization_needs_final_median = True
             for _ in range(self.iterations):
                 values = ratio[normalization_mask]
                 if values.size < max(8, int(0.1 * supported.sum())):
@@ -132,14 +151,17 @@ class SmoothOffReference:
                 scale = 1.4826 * np.median(np.abs(values - amplitude))
                 floor = 100 * np.finfo(float).eps * abs(amplitude)
                 if scale <= floor:
+                    normalization_needs_final_median = False
                     break
                 updated = normalization_mask & (np.abs(ratio - amplitude) <= self.clip_sigma * scale)
                 if np.array_equal(updated, normalization_mask):
+                    normalization_needs_final_median = False
                     break
                 normalization_mask = updated
             if normalization_mask.sum() < max(8, int(0.1 * supported.sum())):
                 raise ReferenceFitError("Too few channels for scalar normalization")
-            amplitude = float(np.median(ratio[normalization_mask]))
+            if normalization_needs_final_median:
+                amplitude = float(np.median(ratio[normalization_mask]))
         if not np.isfinite(amplitude) or amplitude <= 0:
             raise ReferenceFitError("Invalid scalar normalization")
         return ReferenceResult(
